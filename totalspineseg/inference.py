@@ -1,4 +1,5 @@
 import os, argparse, warnings, textwrap, torch, psutil, shutil
+import numpy as np
 from fnmatch import fnmatch
 import multiprocessing as mp
 import nibabel as nib
@@ -31,6 +32,7 @@ def main():
             totalspineseg input_folder output_folder --loc output_folder_loc/step2_output
             totalspineseg input_folder output_folder --loc output_folder_loc/step2_output --loc-suffix _loc
             totalspineseg input_folder output_folder --loc output_folder_loc/step2_output --suffix _T1w _T2w --loc-suffix _T2w_loc
+            totalspineseg input_folder output_folder --save-uncertainties
         '''),
         formatter_class=argparse.RawTextHelpFormatter
     )
@@ -67,6 +69,17 @@ def main():
     parser.add_argument(
         '--step1', action='store_true',
         help='Run only step 1 of the inference process.'
+    )
+    parser.add_argument(
+        '--save-uncertainties', action='store_true', default=False,
+        help=(
+            'Compute and save voxel-wise uncertainty (normalised Shannon entropy) '
+            'from the nnU-Net softmax probability maps produced by Step 2. '
+            'Maps are written to <output>/step2_uncertainties/ and resampled back '
+            'to the original image space like all other outputs. '
+            'The raw .npz probability files are deleted immediately after the '
+            'entropy NIfTIs are saved to reclaim disk space.'
+        )
     )
     parser.add_argument(
         '--keep-only', '-k', type=str, nargs='+', default=[''],
@@ -110,6 +123,7 @@ def main():
     suffix = args.suffix
     loc_suffix = args.loc_suffix
     step1_only = args.step1
+    save_uncertainties = args.save_uncertainties
     keep_only = args.keep_only
     max_workers = args.max_workers
     max_workers_nnunet = min(args.max_workers_nnunet, max_workers)
@@ -123,11 +137,11 @@ def main():
         data_path = Path(os.environ.get('TOTALSPINESEG_DATA', ''))
     else:
         data_path = importlib.resources.files(models)
-    
+
     # Change multiprocessing method if specified
     if args.no_stalling:
         mp.set_start_method('forkserver', force=True)
-    
+
     # Default release to use
     default_release = list(ZIP_URLS.values())[0].split('/')[-2]
 
@@ -137,7 +151,7 @@ def main():
         dict_urls=ZIP_URLS,
         quiet=quiet
         )
-    
+
     # Run inference
     inference(
         input_path=input_path,
@@ -149,6 +163,7 @@ def main():
         suffix=suffix,
         loc_suffix=loc_suffix,
         step1_only=step1_only,
+        save_uncertainties=save_uncertainties,
         keep_only=keep_only,
         max_workers=max_workers,
         max_workers_nnunet=max_workers_nnunet,
@@ -167,6 +182,7 @@ def inference(
         suffix=[''],
         loc_suffix='',
         step1_only=False,
+        save_uncertainties=False,
         keep_only=[''],
         max_workers=os.cpu_count(),
         max_workers_nnunet=int(max(min(os.cpu_count(), psutil.virtual_memory().total / 2**30 // 8), 1)),
@@ -196,6 +212,10 @@ def inference(
         Suffix to use for the localizer images
     step1_only : bool
         If True only the prediction of the first model will be computed.
+    save_uncertainties : bool
+        If True, compute normalised Shannon entropy from the Step 2 softmax
+        probability maps and save as NIfTI files in step2_uncertainties/.
+        The raw .npz files are deleted immediately after to save disk space.
     keep_only : list of string
         If not empty, only the folders listed will be kept and some functions won't be computed.
     max_workers : int
@@ -230,7 +250,7 @@ def inference(
     else:
         if not isinstance(data_path, Path):
             raise ValueError('data_path should be a Path object from pathlib or a string')
-    
+
     # Check if the data folder exists
     if not data_path.exists():
         raise FileNotFoundError(f"The totalspineseg data folder does not exist at {data_path}.")
@@ -255,12 +275,10 @@ def inference(
     if isinstance(device, str):
         assert device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {device}.'
         if device == 'cpu':
-            # let's allow torch to use hella threads
             import multiprocessing
             torch.set_num_threads(multiprocessing.cpu_count())
             device = torch.device('cpu')
         elif device == 'cuda':
-            # multithreading in torch doesn't help nnU-Net if run on GPU
             torch.set_num_threads(1)
             torch.set_num_interop_threads(1)
             device = torch.device('cuda')
@@ -280,6 +298,7 @@ def inference(
             suffix = {suffix}
             loc_suffix = "{loc_suffix}"
             step1_only = {step1_only}
+            save_uncertainties = {save_uncertainties}
             keep_only = {keep_only}
             data_dir = "{data_path}"
             max_workers = {max_workers}
@@ -294,18 +313,15 @@ def inference(
 
         # Check suffixes
         if input_path.name.endswith(".nii.gz"):
-            # Copy file
             dst_path = output_path / 'input_raw' / input_path.name.replace('.nii.gz', '_0000.nii.gz')
             shutil.copy(input_path, dst_path)
         elif input_path.suffix == ".nii":
-            # Compress file                    
             src_img = nib.load(input_path)
             dst_path = output_path / 'input_raw' / input_path.name.replace('.nii', '_0000.nii.gz')
             nib.save(src_img, dst_path)
         else:
             raise ValueError(f"Unknown file type: {''.join(input_path.suffixes)}, please use niftii files")
     else:
-        # If the input is a folder, copy the files to the input_raw folder
         cpdir_mp(
             input_path,
             output_path / 'input_raw',
@@ -330,33 +346,26 @@ def inference(
     if loc_path is not None:
         if not quiet: print('\n' 'Copying localizers to the output folder:')
 
-        # Create the localizers folder
         (output_path / 'localizers').mkdir(parents=True, exist_ok=True)
 
-        # List all localizers in the localizers folder
         locs = list(loc_path.glob(f'*{loc_suffix}.nii.gz')) + list(loc_path.glob(f'*{loc_suffix}.nii')) \
         + list(loc_path.glob(f'sub-*/anat/*{loc_suffix}.nii.gz')) + list(loc_path.glob(f'sub-*/anat/*{loc_suffix}.nii'))
 
-        # Copy the localizers to the output folder
         images = list((output_path / 'input').glob('*_0000.nii.gz'))
         for image in tqdm(images, disable=quiet):
             if '.nii' in loc_path.suffixes:
-                # If the localizers are in a single file, copy it to the localizers folder
                 loc = loc_path
             else:
-                # If the localizers are in a folder, find the matching localizer for the image
                 image_suffix = next((_ for _ in suffix if fnmatch(image.name, f'*{_}_0000.nii.gz')), '')
                 loc = next((_ for _ in locs if fnmatch(image.name, _.name.replace(f'{loc_suffix}.nii', f'{image_suffix}_0000.nii'))), None)
             if loc:
                 dst_loc = output_path / 'localizers' / image.name.replace('_0000.nii.gz', '.nii.gz')
                 if "".join(loc.suffixes) == ".nii":
-                    # Compress loc                    
                     src_loc = nib.load(loc)
                     nib.save(src_loc, dst_loc)
                 else:
-                    # Copy loc
                     shutil.copy(loc, dst_loc)
-        
+
         if not keep_only[0] or 'preview' in keep_only:
             if not quiet: print('\n' 'Generating preview images for the localizers:')
             preview_jpg_mp(
@@ -436,13 +445,10 @@ def inference(
 
     # Get the nnUNet parameters from the results folder
     nnUNetTrainer, nnUNetPlans, configuration = next((nnUNet_results / step1_dataset).glob('*/fold_*')).parent.name.split('__')
-    # Check if the best checkpoint exists, if not use the final checkpoint
     checkpoint = 'checkpoint_best.pth' if (nnUNet_results / step1_dataset / f'{nnUNetTrainer}__{nnUNetPlans}__{configuration}' / f'fold_{fold}' / 'checkpoint_best.pth').is_file() else 'checkpoint_final.pth'
     if not quiet: print(f"Using checkpoint step1: {checkpoint}")
-    # Construct step 1 model folder
     model_folder_step1 = nnUNet_results / step1_dataset / f'{nnUNetTrainer}__{nnUNetPlans}__{configuration}'
-    
-    # Add nnUNetTrainerDAExt trainer
+
     add_trainer("nnUNetTrainerDAExt")
 
     if not quiet: print('\n' 'Running step 1 model:')
@@ -490,7 +496,6 @@ def inference(
     )
 
     if not quiet: print('\n' 'Using an iterative algorithm to label IVDs with the definite labels:')
-    # Labeling is based on the C2-C3, C7-T1 and L5-S1 IVD labels output by step 1 model.
     if loc_path is None:
         iterative_label_mp(
             output_path / 'step1_output',
@@ -533,7 +538,6 @@ def inference(
         )
 
     if not quiet: print('\n' 'Filling spinal canal label to include all non cord spinal canal:')
-    # This will put the spinal canal label in all the voxels between the canal and the cord.
     fill_canal_mp(
         output_path / 'step1_output',
         output_path / 'step1_output',
@@ -659,7 +663,6 @@ def inference(
             )
 
             if not quiet: print('\n' 'Cropping the images to the bounding box of step 1 segmentation:')
-            # This will also delete images without segmentation
             crop_image2seg_mp(
                 output_path / 'step2_input',
                 output_path / 'step1_output',
@@ -682,7 +685,6 @@ def inference(
             )
 
             if not quiet: print('\n' 'Mapping the IVDs labels from the step1 model output to the odd IVDs:')
-            # This will also delete labels without odd IVDs
             extract_alternate_mp(
                 output_path / 'step2_input',
                 output_path / 'step2_input',
@@ -714,12 +716,8 @@ def inference(
 
             # Get the nnUNet parameters from the results folder
             nnUNetTrainer, nnUNetPlans, configuration = next((nnUNet_results / step2_dataset).glob('*/fold_*')).parent.name.split('__')
-            
-            # Check if the final checkpoint exists, if not use the latest checkpoint
             checkpoint = 'checkpoint_best.pth' if (nnUNet_results / step2_dataset / f'{nnUNetTrainer}__{nnUNetPlans}__{configuration}' / f'fold_{fold}' / 'checkpoint_best.pth').is_file() else 'checkpoint_final.pth'
             if not quiet: print(f"Using checkpoint step2: {checkpoint}")
-
-            # Construct step 2 model folder
             model_folder_step2 = nnUNet_results / step2_dataset / f'{nnUNetTrainer}__{nnUNetPlans}__{configuration}'
 
             if not quiet: print('\n' 'Running step 2 model:')
@@ -729,6 +727,7 @@ def inference(
                 output_dir=output_path / 'step2_raw',
                 folds = str(fold),
                 disable_tta = True,
+                save_probabilities = save_uncertainties,  # only write .npz if requested
                 checkpoint = checkpoint,
                 npp = max_workers_nnunet,
                 nps = max_workers_nnunet,
@@ -740,9 +739,47 @@ def inference(
             (output_path / 'step2_raw' / 'plans.json').unlink(missing_ok=True)
             (output_path / 'step2_raw' / 'predict_from_raw_data_args.json').unlink(missing_ok=True)
 
-            # Remove the raw files from step 2 to save space
+            # Remove the step2_input _0000 images; we no longer need them
             for f in (output_path / 'step2_input').glob('*_0000.nii.gz'):
                 f.unlink(missing_ok=True)
+
+            # ----------------------------------------------------------------
+            # UNCERTAINTY: compute normalised Shannon entropy from Step 2
+            # softmax .npz files and save as NIfTI in step2_uncertainties/.
+            # Only runs when --save-uncertainties was passed.
+            # The .npz files are deleted immediately after to reclaim disk space.
+            # ----------------------------------------------------------------
+            if save_uncertainties:
+                if not quiet: print('\n' 'Calculating voxel-wise uncertainty (Shannon entropy) from step 2 probability maps:')
+                uncertainties_dir = output_path / 'step2_uncertainties'
+                uncertainties_dir.mkdir(parents=True, exist_ok=True)
+
+                npz_files = sorted((output_path / 'step2_raw').glob('*.npz'))
+                for npz_path in tqdm(npz_files, disable=quiet):
+                    # Softmax array: shape (C, X, Y, Z)
+                    npz_data = np.load(npz_path)
+                    probs = npz_data[npz_data.files[0]].astype(np.float32)
+
+                    # Normalised Shannon entropy — range [0, 1] where 1 = maximally uncertain.
+                    # Dividing by log(C) makes the value independent of the number of classes.
+                    # 1e-8 epsilon prevents log(0) for zero-probability classes.
+                    entropy = -np.sum(probs * np.log(probs + 1e-8), axis=0) / np.log(probs.shape[0])
+
+                    # Borrow affine + header from the companion .nii.gz so the
+                    # entropy volume sits on the same voxel grid as the segmentation.
+                    nii_path = npz_path.with_suffix('').with_suffix('.nii.gz')
+                    ref_nii = nib.load(nii_path)
+                    entropy_nii = nib.Nifti1Image(entropy, affine=ref_nii.affine, header=ref_nii.header)
+                    entropy_nii.set_data_dtype(np.float32)
+
+                    # Save with identical filename so the resampling loop below
+                    # can pair each entropy map with its input_raw counterpart.
+                    nib.save(entropy_nii, uncertainties_dir / nii_path.name)
+
+                # Delete .npz files now that entropy NIfTIs are saved.
+                if not quiet: print('\n' 'Removing step 2 raw .npz files to save space...')
+                for f in (output_path / 'step2_raw').glob('*.npz'):
+                    f.unlink(missing_ok=True)
 
             if not keep_only[0] or 'preview' in keep_only:
                 if not quiet: print('\n' 'Generating preview images for step 2:')
@@ -814,7 +851,6 @@ def inference(
                 )
 
             if not quiet: print('\n' 'Filling spinal canal label to include all non cord spinal canal:')
-            # This will put the spinal canal label in all the voxels between the canal and the cord.
             fill_canal_mp(
                 output_path / 'step2_output',
                 output_path / 'step2_output',
@@ -876,11 +912,12 @@ def inference(
     # Keep and resample output data
     folder_list = [f for f in os.listdir(str(output_path)) if not f.startswith('input')]
     folder_dict = {
-        'step1_output':{'interpolation':'nearest', 'description':'Step 1 output'},
-        'step1_cord':{'interpolation':'linear', 'description':'Spinal cord soft segmentations'},
-        'step1_canal':{'interpolation':'linear', 'description':'Spinal canal soft segmentations'},
-        'step1_levels':{'interpolation':'label', 'description':'Single voxels at the posterior tip of discs'},
-        'step2_output':{'interpolation':'nearest', 'description':'Segmentation and labeling of the vertebrae, discs, spinal cord and spinal canal'}
+        'step1_output':      {'interpolation': 'nearest', 'description': 'Step 1 output'},
+        'step1_cord':        {'interpolation': 'linear',  'description': 'Spinal cord soft segmentations'},
+        'step1_canal':       {'interpolation': 'linear',  'description': 'Spinal canal soft segmentations'},
+        'step1_levels':      {'interpolation': 'label',   'description': 'Single voxels at the posterior tip of discs'},
+        'step2_output':      {'interpolation': 'nearest', 'description': 'Segmentation and labeling of the vertebrae, discs, spinal cord and spinal canal'},
+        'step2_uncertainties':{'interpolation': 'linear', 'description': 'Voxel-wise uncertainty (normalised Shannon entropy) of Step 2 model'},
     }
     for folder in folder_list:
         if not keep_only[0] or folder in keep_only:
@@ -898,9 +935,7 @@ def inference(
                     )
                     if not quiet: print(f'\n{folder_dict[folder]["description"]}:')
                     if not quiet: print(f'{str(output_path)}/{folder}')
-
         else:
-            # Remove the folder
             if not quiet: print('\n' f'Removing {folder}')
             shutil.rmtree(output_path / folder, ignore_errors=True)
 
@@ -910,7 +945,7 @@ def inference(
     # Remove the input folder
     if not output_iso:
         shutil.rmtree(output_path / 'input', ignore_errors=True)
-    
+
     # Return list of output paths
     return [str(output_path / folder) for folder in os.listdir(str(output_path))]
 
