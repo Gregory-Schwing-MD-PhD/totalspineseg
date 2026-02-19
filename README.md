@@ -172,7 +172,7 @@ bash "$TOTALSPINESEG"/scripts/train.sh [DATASET_ID [FOLD]]
 2. Run the model on a folder containing niftii images (`.nii.gz` or `.nii`), or on a single niftii file:
 > If you haven't trained the model, the script will automatically download the pre-trained models from the GitHub release.
 ```bash
-totalspineseg INPUT OUTPUT_FOLDER [--step1] [--iso]
+totalspineseg INPUT OUTPUT_FOLDER [--step1] [--iso] [--save-uncertainties]
 ```
 
    This will process the images in INPUT or the single image and save the results in OUTPUT_FOLDER.
@@ -180,6 +180,8 @@ totalspineseg INPUT OUTPUT_FOLDER [--step1] [--iso]
    **Important Note:** By default, the output segmentations are resampled back to the input image space. If you prefer to obtain the outputs in the model's original 1mm isotropic resolution, especially useful for visualization purposes, we strongly recommend using the `--iso` argument.
 
    Additionally, you can use the `--step1` parameter to run only the step 1 model, which outputs a single label for all vertebrae, including the sacrum.
+
+   You can use the `--save-uncertainties` parameter to compute and save a voxel-wise uncertainty map (normalised Shannon entropy) derived from the Step 2 model's softmax probability outputs. The map is saved as a float32 NIfTI in `step2_uncertainties/` and resampled back to the input image space alongside all other outputs. The raw `.npz` probability files are deleted automatically after the entropy map is written to reclaim disk space. This flag is useful for downstream tasks that require a measure of model confidence, such as LSTV (Castellvi) classification.
 
    For more options, you can use the `--help` parameter:
 ```bash
@@ -198,7 +200,8 @@ output_folder/
 ├── step1_canal/             # Spinal canal soft segmentations
 ├── step1_levels/            # Single voxel in canal centerline at each IVD level
 ├── step2_raw/               # Raw outputs from step 2 model
-└── step2_output/            # Results of iterative labeling algorithm for step 2 (final output)
+├── step2_output/            # Results of iterative labeling algorithm for step 2 (final output)
+└── step2_uncertainties/     # [optional] Voxel-wise uncertainty maps from step 2 (--save-uncertainties)
 ```
 
 **Important Note:** While TotalSpineSeg provides spinal cord segmentation, it is not intended to replace validated methods for cross-sectional area (CSA) analysis. The spinal cord segmentation from TotalSpineSeg has not been validated for CSA measurements, nor has it been tested on cases involving spinal cord compressions, MS lesions, or other spinal cord abnormalities. For accurate CSA analysis, we strongly recommend using the validated algorithms available in the [Spinal Cord Toolbox](https://spinalcordtoolbox.com/user_section/tutorials/segmentation.html).
@@ -208,6 +211,7 @@ Key points:
 - Preview images in JPEG format
 - step1_levels: single voxel in canal centerline at each IVD level, numbered from C1 (1 above C1, 2 above C2, etc.)
 - step2_output: final labeled vertebrae, discs, cord, and canal
+- step2_uncertainties: normalised Shannon entropy per voxel, float32, range [0, 1] where 1 = maximally uncertain (only present when `--save-uncertainties` is used)
 
 ## Localizer based labeling
 
